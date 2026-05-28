@@ -1,0 +1,12 @@
+# Build artifacts from exploit testing
+*.egg-info/
+__pycache__/
+*.pyc
+.eggs/
+
+# Temporary files created during exploit runs
+/tmp/
+
+# TLS certificates generated for exploit testing (keep pre-generated ones in repo for reproducibility)
+# *.crt
+# *.key
