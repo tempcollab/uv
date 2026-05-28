@@ -13,8 +13,14 @@ AUDIT_VENV="/tmp/audit_shared_venv"
 # ---------------------------------------------------------------------------
 # Resolve uv
 # ---------------------------------------------------------------------------
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
 if [[ -x "/home/agentuser/repo/target/release/uv" ]]; then
     UV_BIN="/home/agentuser/repo/target/release/uv"
+elif [[ -x "${REPO_ROOT}/target/release/uv" ]]; then
+    UV_BIN="${REPO_ROOT}/target/release/uv"
+elif [[ -x "${REPO_ROOT}/target/debug/uv" ]]; then
+    UV_BIN="${REPO_ROOT}/target/debug/uv"
 elif command -v uv &>/dev/null; then
     UV_BIN="$(command -v uv)"
 else
