@@ -1,0 +1,8 @@
+# Build artifacts from exploit testing
+*.egg-info/
+__pycache__/
+*.pyc
+.eggs/
+
+# Temporary files created during exploit runs
+/tmp/
