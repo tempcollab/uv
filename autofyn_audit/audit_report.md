@@ -10,22 +10,23 @@
 
 ## Executive Summary
 
-This audit identified two independently verified vulnerabilities in uv, plus two defense-in-depth
-gaps. The most critical finding is that build backends (setup.py, PEP 517 build systems) inherit the
-full parent process environment, allowing malicious packages to exfiltrate sensitive credentials
-like AWS keys, API tokens, and other secrets. This is a supply-chain attack vector affecting any
-user who installs packages from untrusted sources.
+This audit identified three independently verified vulnerabilities in uv, plus two defense-in-depth
+gaps. The most critical findings are: (1) build backends inherit the full parent process
+environment, allowing malicious packages to exfiltrate sensitive credentials; and (2)
+`uv self update` downloads and executes a shell installer from `UV_ASTRAL_MIRROR_URL` without any
+hash or signature verification, enabling RCE for anyone who controls the mirror URL.
 
 ---
 
 ## Vulnerability Summary
 
-| Severity | ID          | Title                                 | Status                  |
-| -------- | ----------- | ------------------------------------- | ----------------------- |
-| **HIGH** | UV-2026-001 | Credential Leakage via Build Backends | VERIFIED                |
-| MEDIUM   | UV-2026-002 | GitHub API URL Injection              | VERIFIED                |
-| LOW      | UV-2026-003 | Symlink Escape in .data/scripts       | Defense-in-depth gap    |
-| INFO     | UV-2026-004 | RECORD Hash Not Validated             | By design (matches pip) |
+| Severity | ID          | Title                                  | Status                  |
+| -------- | ----------- | -------------------------------------- | ----------------------- |
+| **HIGH** | UV-2026-001 | Credential Leakage via Build Backends  | VERIFIED                |
+| **HIGH** | UV-2026-005 | Self-Update Installer Script Injection | VERIFIED                |
+| MEDIUM   | UV-2026-002 | GitHub API URL Injection               | VERIFIED                |
+| LOW      | UV-2026-003 | Symlink Escape in .data/scripts        | Defense-in-depth gap    |
+| INFO     | UV-2026-004 | RECORD Hash Not Validated              | By design (matches pip) |
 
 ---
 
@@ -137,6 +138,70 @@ Replace `as_rev()` with `as_url_rev()` at `resolver.rs:105`.
 
 ---
 
+### UV-2026-005: Self-Update Installer Script Injection (HIGH)
+
+**Location:** `crates/uv/src/commands/self_update.rs:340-395` (`run_official_updater`)
+
+**Description:** `uv self update` downloads a shell installer (`uv-installer.sh`) from
+`UV_ASTRAL_MIRROR_URL` and executes it directly without any hash or signature verification. The
+download URL is constructed as:
+
+```
+{UV_ASTRAL_MIRROR_URL}/github/uv/releases/download/{version}/uv-installer.sh
+```
+
+Any party who controls `UV_ASTRAL_MIRROR_URL` — including a compromised corporate Nexus/Artifactory
+mirror, a CI environment variable, or a network MITM on a non-TLS mirror — can deliver an arbitrary
+shell script that executes as the user running `uv self update`.
+
+**Attack Vector:** An attacker sets (or intercepts) `UV_ASTRAL_MIRROR_URL` to point at a server they
+control. They also need `UV_INSECURE_HOST` to allow self-signed certs, or they use a compromised CA.
+When the victim runs `uv self update`, uv fetches the malicious installer and executes it — with no
+integrity check.
+
+**Root Cause:**
+
+```rust
+// self_update.rs:359-365
+download_installer_from_urls(
+    &installer_urls,
+    &installer_path,
+    client_builder,
+    github_token,
+)
+.await?;
+// Then immediately executed with no hash check:
+execute_official_installer(&installer_path, ...).await?;
+```
+
+There is no SHA256, SHA512, or GPG verification between download and execution.
+
+**Impact:** HIGH. Full RCE as the invoking user on any machine where `UV_ASTRAL_MIRROR_URL` is
+attacker-controlled. In enterprise environments where a mirror is shared across many CI runners and
+developer workstations, a single mirror compromise results in mass code execution.
+
+**CVSS:** AV:N/AC:H/PR:N/UI:R/S:U/C:H/I:H/A:H (Score: 7.5)
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploits/03_self_update_injection/run_exploit.sh
+```
+
+**Verified:** PASS. The malicious installer was fetched from the mock HTTPS server and executed,
+writing `/tmp/exploit_03_marker.txt` to prove RCE.
+
+**Recommendation:**
+
+1. Publish a detached GPG signature or SHA256 checksum alongside each `uv-installer.sh` and verify
+   it before execution.
+2. Alternatively, publish the installer inline as a GitHub release asset and verify via the GitHub
+   API `assets[].digest` field.
+3. As a defense-in-depth measure, display the installer hash to the user before execution when
+   `UV_ASTRAL_MIRROR_URL` overrides the default mirror.
+
+---
+
 ### UV-2026-003: Symlink Escape in .data/scripts (LOW)
 
 **Location:** `crates/uv-install-wheel/src/wheel.rs:453-467`
@@ -212,6 +277,9 @@ bash autofyn_audit/exploits/01_credential_leakage/run_exploit.sh
 
 # Exploit 2: GitHub API URL Injection
 bash autofyn_audit/exploits/02_github_url_injection/run_exploit.sh
+
+# Exploit 3: Self-Update Installer Script Injection
+bash autofyn_audit/exploits/03_self_update_injection/run_exploit.sh
 ```
 
 ---
@@ -258,3 +326,12 @@ bash autofyn_audit/exploits/02_github_url_injection/run_exploit.sh
 ### UV-2026-004 (RECORD Hash)
 
 - `crates/uv-install-wheel/src/wheel.rs:955-956` — Comment: "We don't heal the hash"
+
+### UV-2026-005 (Self-Update Injection)
+
+- `crates/uv/src/commands/self_update.rs:340-395` — `run_official_updater()` downloads and executes
+  installer
+- `crates/uv/src/commands/self_update.rs:359-365` — `download_installer_from_urls()` with no hash
+  verification
+- `crates/uv/src/commands/self_update.rs:367-374` — `execute_official_installer()` immediately after
+  download
