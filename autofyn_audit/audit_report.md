@@ -11,9 +11,10 @@
 ## Executive Summary
 
 This audit identified **fifteen independently verified vulnerabilities** in uv, plus two
-defense-in-depth gaps. Additionally, we demonstrate **three exploit chains** that combine
+defense-in-depth gaps. Additionally, we demonstrate **five exploit chains** that combine
 vulnerabilities for end-to-end critical attacks (supply chain credential theft, HTTPS credential
-exfiltration, silent package replacement). The most critical findings are:
+exfiltration, silent package replacement, universal malware via marker bypass, persistent shell
+RCE). The most critical findings are:
 
 1. **UV_PYTHON_DOWNLOADS_JSON_URL RCE (CRITICAL):** The `UV_PYTHON_DOWNLOADS_JSON_URL` environment
    variable accepts plain HTTP URLs and the SHA256 hash field is optional. An attacker who controls
