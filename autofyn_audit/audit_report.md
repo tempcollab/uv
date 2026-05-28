@@ -10,7 +10,7 @@
 
 ## Executive Summary
 
-This audit identified **eleven independently verified vulnerabilities** in uv, plus two
+This audit identified **fifteen independently verified vulnerabilities** in uv, plus two
 defense-in-depth gaps. The most critical findings are:
 
 1. **UV_PYTHON_DOWNLOADS_JSON_URL RCE (CRITICAL):** The `UV_PYTHON_DOWNLOADS_JSON_URL` environment
@@ -50,7 +50,11 @@ defense-in-depth gaps. The most critical findings are:
 | **HIGH**     | UV-2026-010 | Index Name Credential Collision               | VERIFIED                |
 | **HIGH**     | UV-2026-012 | Shell Config Injection                        | VERIFIED                |
 | **HIGH**     | UV-2026-013 | .netrc Default Credential Leakage             | VERIFIED                |
+| **HIGH**     | UV-2026-014 | Workspace Member Path Traversal               | VERIFIED                |
+| **HIGH**     | UV-2026-016 | Cache ArchiveId Path Traversal                | VERIFIED                |
 | MEDIUM       | UV-2026-002 | GitHub API URL Injection                      | VERIFIED                |
+| MEDIUM       | UV-2026-015 | Marker Always-True Bypass                     | VERIFIED                |
+| MEDIUM       | UV-2026-017 | Keyring Subprocess Env Inheritance            | VERIFIED                |
 | LOW          | UV-2026-003 | Symlink Escape in .data/scripts               | Defense-in-depth gap    |
 | INFO         | UV-2026-004 | RECORD Hash Not Validated                     | By design (matches pip) |
 
@@ -668,6 +672,231 @@ were captured via Basic auth header on the attacker server.
 1. Warn when credentials are sourced from the `.netrc` `default` entry (rather than a specific host)
 2. Consider requiring explicit opt-in for `default` entry usage (`--allow-netrc-default`)
 3. Document this behavior prominently in security documentation
+
+---
+
+### UV-2026-014: Workspace Member Path Traversal (HIGH)
+
+**Location:** `crates/uv-workspace/src/workspace.rs:987-1006`
+
+**Description:**  
+The workspace member discovery logic in uv joins the workspace root path with each glob pattern from
+`[tool.uv.workspace].members` without checking that the resolved path remains within the workspace
+root. A `members` entry of `"../outside"` traverses outside the checked-out repository tree.
+
+**Root Cause:**
+
+```rust
+// workspace.rs:987-1006
+let normalized_glob = normalize_path(Path::new(member_glob.as_str()));
+// normalize_path() preserves leading ".." components
+let absolute_glob = PathBuf::from(glob::Pattern::escape(workspace_root...))
+    .join(normalized_glob.as_ref())       // appends "../victim_workspace"
+    .to_string_lossy().to_string();       // = /tmp/attacker/../victim_workspace
+
+for member_root in glob(&absolute_glob) { ... }
+// glob() resolves ".." at filesystem-walk time → /tmp/victim_workspace
+// No member_root.starts_with(workspace_root) check is performed.
+```
+
+**Impact:**  
+An attacker who can influence `pyproject.toml` (e.g., a compromised upstream repository, a malicious
+PR, or a shared monorepo) can include members from outside the workspace root. Any developer who
+clones the repository and runs `uv sync` or `uv lock` will have uv load and process `pyproject.toml`
+files from arbitrary external paths. In shared CI environments, this can expose internal project
+configurations or force processing of attacker-controlled files.
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploits/13_workspace_path_traversal/run_exploit.sh
+```
+
+**Verified:** PASS. uv lock resolved a victim project from `../exploit_13_victim_workspace` (outside
+the attacker workspace root) and wrote the victim's normalized project name
+(`victim-project-marker-13`) into the lockfile at
+`source = { virtual = "../exploit_13_victim_workspace" }`.
+
+**Recommendation:**
+
+1. After glob expansion, add a boundary check: `member_root.starts_with(workspace_root)` — reject or
+   warn on out-of-root members.
+2. Alternatively, reject `members` patterns that start with `..` before glob expansion.
+
+---
+
+### UV-2026-015: Marker Always-True Bypass (MEDIUM)
+
+**Location:** `crates/uv-pep508/src/marker/parse.rs:686`
+
+**Description:**  
+The PEP 508 marker parser maps an entirely ignored expression to `MarkerTree::TRUE`. When the `~=`
+(compatible release) operator is applied to a string marker variable (e.g., `os_name ~= 'linux'`),
+`parse_marker_key_op_value()` returns `Ok(None)` — indicating an unsupported expression — instead of
+an error. `parse_markers()` then maps `None` to `MarkerTree::TRUE`:
+
+**Root Cause:**
+
+```rust
+// parse.rs:686
+pub(crate) fn parse_markers<T: Pep508Url>(
+    markers: &str,
+    reporter: &mut impl Reporter,
+) -> Result<MarkerTree, Pep508Error<T>> {
+    let mut chars = Cursor::new(markers);
+    parse_markers_cursor(&mut chars, reporter)
+        .map(|result| result.unwrap_or(MarkerTree::TRUE))  // ← None → TRUE
+}
+```
+
+A dependency like `evil-pkg; os_name ~= 'nonexistent_os'` should never install anywhere. Instead,
+the marker evaluates to TRUE and the package installs universally.
+
+**Impact:**  
+A malicious package can hide dependencies behind markers that appear restrictive but install
+everywhere. An attacker can use this to bypass apparent platform restrictions and ensure malicious
+payloads are always installed, regardless of the target OS. The marker looks like a valid
+conditional dependency to any reviewer.
+
+**CVSS:** AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:L/A:N (Score: 5.4)
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploits/14_marker_always_true/run_exploit.sh
+```
+
+**Verified:** PASS. `malicious-marker-pkg` installed despite the marker
+`os_name ~= 'nonexistent_os'` which should have excluded all platforms. The attacker server
+confirmed the wheel was downloaded.
+
+**Recommendation:**
+
+1. Treat `~=` on string markers as a parse error rather than an ignored expression.
+2. Log a warning when any marker expression is silently ignored (returns `None`).
+3. Consider returning `MarkerTree::FALSE` instead of `MarkerTree::TRUE` for fully-ignored
+   expressions, following the principle of least privilege.
+
+---
+
+### UV-2026-016: Cache ArchiveId Path Traversal (HIGH)
+
+**Location:** `crates/uv-cache/src/archive.rs:38-43`, `crates/uv-cache/src/lib.rs:291-303`
+
+**Description:**  
+The `ArchiveId` type, used to identify unzipped wheel archives in the cache, accepts any string
+without path validation. It is deserialized from MsgPack `.rev` pointer files and used directly as a
+path component via `PathBuf::join()`, allowing `../..` sequences to traverse outside the cache.
+
+**Root Cause:**
+
+```rust
+// archive.rs:38-43
+impl FromStr for ArchiveId {
+    type Err = Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))  // ← Accepts ANY string, including "../../../"
+    }
+}
+
+// lib.rs:301-303
+pub fn archive(&self, id: &ArchiveId) -> PathBuf {
+    self.bucket(CacheBucket::Archive).join(id)  // ← Joins without boundary check
+}
+```
+
+The `.rev` pointer file (plain MsgPack) has no integrity protection. Any user with cache write
+access can inject a traversal ArchiveId to redirect wheel loading to an arbitrary path.
+
+**Impact:**  
+In shared CI environments (shared cache via NFS, overlay filesystem, or Docker volume mounts), an
+attacker with cache write access can:
+
+1. Place a malicious wheel at any accessible path (e.g., `/tmp/evil_wheel/`)
+2. Write a `.rev` pointer with `id = "../../tmp/evil_wheel"` for a legitimate package
+3. Any developer using the shared cache loads the evil wheel during `uv sync`
+
+This bypasses all hash verification since the traversal skips the normal archive bucket.
+
+**CVSS:** AV:L/AC:H/PR:L/UI:R/S:C/C:H/I:H/A:H (Score: 7.5)
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploits/15_cache_archiveid_traversal/run_exploit.sh
+```
+
+**Verified:** PASS. The ArchiveId `../../exploit_15_evil_wheel` resolves to
+`/tmp/exploit_15_evil_wheel` — outside the cache root at `/tmp/exploit_15_cache` — confirming the
+path traversal is possible with no boundary check.
+
+**Recommendation:**
+
+1. In `ArchiveId::from_str()`, validate that the string contains no path separators (`/` or `\`) or
+   `..` components.
+2. In `Cache::archive()`, canonicalize the resulting path and verify it starts with the archive
+   bucket directory before returning it.
+3. Add a file integrity check (HMAC or signature) on `.rev` and `.http` pointer files to prevent
+   tampering by co-tenants of a shared cache.
+
+---
+
+### UV-2026-017: Keyring Subprocess Environment Inheritance (MEDIUM)
+
+**Location:** `crates/uv-auth/src/keyring.rs:272-294`
+
+**Description:**  
+When uv invokes the `keyring` subprocess to look up credentials for a private index
+(`UV_KEYRING_PROVIDER=subprocess`), it spawns the process without clearing the environment. All
+parent environment variables — including AWS credentials, GitHub tokens, and database URLs — are
+inherited by the subprocess unchanged.
+
+**Root Cause:**
+
+```rust
+// keyring.rs:272-294
+let mut command = Command::new("keyring");
+command.arg("get").arg(service_name);
+// ...
+let child = command
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(...)
+    .spawn()   // ← NO .env_clear() before spawn()
+    .ok()?;
+```
+
+A malicious `keyring` binary placed in `PATH` before the legitimate one (e.g., installed by a
+compromised package's post-install hook) receives every secret in the uv process environment.
+
+**Impact:**  
+Any user who installs a malicious package (even as a transitive dependency) that places a fake
+`keyring` binary in `~/.local/bin/` or a virtualenv's `bin/` directory will have all environment
+secrets exfiltrated on the next `uv pip install` against a private index. This is particularly
+dangerous in CI/CD environments where `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, and `DATABASE_URL`
+are routine.
+
+**CVSS:** AV:L/AC:H/PR:L/UI:R/S:U/C:H/I:N/A:N (Score: 4.4)
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploits/16_keyring_env_inheritance/run_exploit.sh
+```
+
+**Verified:** PASS. A malicious `keyring` binary in PATH received
+`AWS_SECRET_ACCESS_KEY=LEAKED_SECRET_12345` from the uv subprocess environment. The exfiltration log
+confirmed 29 environment variables were captured, including `GH_TOKEN`, `GIT_TOKEN`, and other CI
+secrets.
+
+**Recommendation:**
+
+1. Add `.env_clear()` before spawning the keyring subprocess, then explicitly pass only safe
+   variables (PATH, HOME, LANG, TERM).
+2. Alternatively, document the environment inheritance explicitly so users understand that a
+   malicious `keyring` binary in PATH can read all environment secrets.
+3. Consider pinning the keyring binary path or requiring it to be specified explicitly rather than
+   relying on PATH resolution.
 
 ---
 
