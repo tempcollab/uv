@@ -1025,6 +1025,60 @@ cached package with malicious code, bypassing all hash checks.
 bash autofyn_audit/exploit_chains/chain_03_cache_poison_silent_replace/run_chain.sh
 ```
 
+### CHAIN-004: Universal Malware via Marker Bypass (CRITICAL)
+
+**Chained Vulnerabilities:** UV-2026-015 + UV-2026-001
+
+**Attack Scenario:**
+
+1. Attacker publishes a package with a dependency like:
+   `Requires-Dist: hidden-malware; os_name ~= 'nonexistent'`
+2. Code reviewers see the marker and assume the dependency only installs on rare/nonexistent
+   platforms — they conclude it is harmless / dead code
+3. UV-2026-015: The `~=` operator on string markers is unsupported; `parse_markers()` maps `None` →
+   `MarkerTree::TRUE` — the dependency installs on **ALL** platforms
+4. The `hidden-malware` sdist builds from source, running `setup.py` in a subprocess
+5. UV-2026-001: `uv` passes the full parent environment to the build subprocess
+6. `setup.py` exfiltrates `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, `CI_DEPLOY_KEY` to attacker
+
+**Impact:** Attackers can hide unconditional malware behind markers that appear to exclude all
+platforms. Code review of dependency metadata is entirely ineffective against this attack.
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploit_chains/chain_04_marker_universal_malware/run_chain.sh
+```
+
+### CHAIN-005: Persistent Shell RCE via Workspace Escape (CRITICAL)
+
+**Chained Vulnerabilities:** UV-2026-014 + UV-2026-012
+
+**Attack Scenario:**
+
+1. Attacker creates a repository with a workspace `pyproject.toml` using
+   `members = ["../chain_05_external"]` — a path that escapes the workspace root
+2. The external project's `pyproject.toml` contains a malicious `tool-bin-dir` value:
+   `/tmp/$(touch /tmp/chain_05_rce_marker)`
+3. The workspace ships a `setup.sh` that reads `tool-bin-dir` from the external project config and
+   passes it to `uv tool update-shell`
+4. Developer clones the attacker's repository and runs `uv lock` to resolve the workspace
+5. UV-2026-014: `uv lock` follows the `../` traversal, loading the external `pyproject.toml` without
+   any boundary check — validating the out-of-workspace project as a workspace member
+6. Developer runs `bash setup.sh` (standard project setup step)
+7. UV-2026-012: `backslash_escape()` does not escape `$` — the malicious `tool-bin-dir` is written
+   verbatim to `~/.bashrc`: `export PATH="/tmp/$(touch /tmp/chain_05_rce_marker):$PATH"`
+8. On next shell startup, the command executes with developer's privileges — persistent RCE
+
+**Impact:** Cloning a malicious workspace repository and running standard project setup commands
+leads to persistent RCE on every future shell session.
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploit_chains/chain_05_workspace_shell_rce/run_chain.sh
+```
+
 ---
 
 ## Reproduction Instructions
